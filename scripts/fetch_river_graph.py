@@ -59,6 +59,21 @@ OUT_FIELDS = ",".join(
 
 PAGE_SIZE = 2000
 
+# Hard cap on pagination iterations to bound runtime/memory if the API
+# misbehaves and keeps setting exceededTransferLimit. Expected corpus is
+# ~8,400 segments; 100 pages at PAGE_SIZE=2000 is an ample ceiling.
+MAX_PAGES = 100
+
+# Safety cap for connector back-fill iterations. Empirically converges in 1-2.
+MAX_CONNECTOR_ITERATIONS = 3
+
+# ArcGIS REST services reject overly long WHERE clauses; chunk IN(...) queries.
+CONNECTOR_QUERY_CHUNK = 500
+
+# Fallback velocity (m/s) for connector segments where EROM vama is missing
+# and no downstream neighbor velocity is available.
+MIN_FALLBACK_VELOCITY_MPS = 0.3
+
 # Unit conversions
 CFS_TO_CMS = 0.0283168
 FT_PER_S_TO_M_PER_S = 0.3048
@@ -94,14 +109,14 @@ TOWNS: list[dict[str, Any]] = [
 OUTPUT_PATH = Path(__file__).resolve().parent.parent / "data" / "mississippi.geojson"
 
 
-def fetch_all_features() -> list[dict[str, Any]]:
-    """Paginate through the ArcGIS REST service and return all raw features."""
+def fetch_where(where: str, label: str) -> list[dict[str, Any]]:
+    """Paginate through the ArcGIS REST service for a given WHERE clause."""
     features: list[dict[str, Any]] = []
     offset = 0
     page = 1
     while True:
         params = {
-            "where": WHERE_CLAUSE,
+            "where": where,
             "outFields": OUT_FIELDS,
             "outSR": 4326,
             "returnGeometry": "true",
@@ -110,7 +125,7 @@ def fetch_all_features() -> list[dict[str, Any]]:
             "resultOffset": offset,
             "supportsPagination": "true",
         }
-        print(f"Fetching page {page}...", end=" ", flush=True)
+        print(f"[{label}] Fetching page {page}...", end=" ", flush=True)
         r = requests.get(NHD_URL, params=params, timeout=120)
         r.raise_for_status()
         payload = r.json()
@@ -120,16 +135,48 @@ def fetch_all_features() -> list[dict[str, Any]]:
         print(f"{len(batch)} features.")
         features.extend(batch)
         if len(batch) < PAGE_SIZE or not payload.get("exceededTransferLimit", False):
-            # No more pages (ArcGIS sets exceededTransferLimit when truncated).
             if len(batch) == PAGE_SIZE and payload.get("exceededTransferLimit", False):
                 offset += PAGE_SIZE
                 page += 1
+                if page > MAX_PAGES:
+                    raise RuntimeError(
+                        f"[{label}] pagination exceeded MAX_PAGES={MAX_PAGES}; "
+                        "aborting to avoid runaway fetch."
+                    )
                 continue
             break
         offset += PAGE_SIZE
         page += 1
+        if page > MAX_PAGES:
+            raise RuntimeError(
+                f"[{label}] pagination exceeded MAX_PAGES={MAX_PAGES}; "
+                "aborting to avoid runaway fetch."
+            )
+    return features
+
+
+def fetch_all_features() -> list[dict[str, Any]]:
+    """Fetch the initial named-river feature set."""
+    features = fetch_where(WHERE_CLAUSE, "named-rivers")
     print(f"Done. Total: {len(features)} segments.")
     return features
+
+
+def fetch_connectors_by_hydroseq(
+    hydroseqs: list[int],
+) -> list[dict[str, Any]]:
+    """Fetch NHDPlus HR segments whose hydroseq is in the given list.
+
+    Chunked to avoid ArcGIS WHERE-clause length limits.
+    """
+    out: list[dict[str, Any]] = []
+    for i in range(0, len(hydroseqs), CONNECTOR_QUERY_CHUNK):
+        chunk = hydroseqs[i : i + CONNECTOR_QUERY_CHUNK]
+        in_list = ",".join(str(h) for h in chunk)
+        where = f"hydroseq IN ({in_list})"
+        label = f"connectors {i // CONNECTOR_QUERY_CHUNK + 1}"
+        out.extend(fetch_where(where, label))
+    return out
 
 
 def esri_paths_to_linestring(geom: dict[str, Any]) -> dict[str, Any] | None:
@@ -153,6 +200,27 @@ def segment_midpoint(geometry: dict[str, Any]) -> tuple[float, float]:
     return float(mid[0]), float(mid[1])
 
 
+def clean_nhd_numeric(value: Any) -> float | None:
+    """Coerce an NHDPlus HR numeric attribute, mapping no-data sentinels to None.
+
+    NHDPlus HR encodes "no data" as -9998 or -9999 across many numeric fields
+    (slope, totdasqkm, lengthkm, streamorde, etc.). Passing these through into
+    the GeoJSON contract would silently poison any downstream math consumer.
+    """
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f) or math.isinf(f):
+        return None
+    # NHD sentinels. Use a small tolerance to catch float-encoded variants.
+    if f <= -9998.0 + 1e-6:
+        return None
+    return f
+
+
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r = 6371.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -163,7 +231,9 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def build_feature(
-    raw: dict[str, Any], hydroseq_to_id: dict[int, str]
+    raw: dict[str, Any],
+    hydroseq_to_id: dict[int, str],
+    velocity_fallback_mps: float | None = None,
 ) -> dict[str, Any] | None:
     attrs = raw.get("attributes", {})
     geom = esri_paths_to_linestring(raw.get("geometry", {}))
@@ -180,12 +250,21 @@ def build_feature(
         return None
 
     # NHDPlus HR uses -9998/-9999 sentinels for "no data" on EROM attributes.
-    # These are not valid physics inputs; skip such segments.
-    if float(qama) <= 0 or float(vama) <= 0:
+    # qama <= 0 is always a skip — we need a real discharge for physics.
+    # vama <= 0 can be patched for connector segments via a downstream-neighbor
+    # fallback (caller supplies velocity_fallback_mps for those cases).
+    if float(qama) <= 0:
         return None
 
+    vama_f = float(vama)
+    if vama_f <= 0:
+        if velocity_fallback_mps is None:
+            return None
+        flow_velocity = max(velocity_fallback_mps, MIN_FALLBACK_VELOCITY_MPS)
+    else:
+        flow_velocity = vama_f * FT_PER_S_TO_M_PER_S  # m/s
+
     flow_rate = float(qama) * CFS_TO_CMS  # m^3/s
-    flow_velocity = float(vama) * FT_PER_S_TO_M_PER_S  # m/s
     # Leopold & Maddock (1953) downstream hydraulic geometry
     channel_width = 2.66 * (flow_rate**0.5)
     mean_depth = 0.294 * (flow_rate**0.36)
@@ -205,10 +284,10 @@ def build_feature(
         "mean_depth": mean_depth,
         "downstream_ids": downstream_ids,
         "huc8": reachcode[:8] if reachcode else "",
-        "stream_order": attrs.get("streamorde"),
-        "length_km": attrs.get("lengthkm"),
-        "slope": attrs.get("slope"),
-        "drainage_area_sqkm": attrs.get("totdasqkm"),
+        "stream_order": clean_nhd_numeric(attrs.get("streamorde")),
+        "length_km": clean_nhd_numeric(attrs.get("lengthkm")),
+        "slope": clean_nhd_numeric(attrs.get("slope")),
+        "drainage_area_sqkm": clean_nhd_numeric(attrs.get("totdasqkm")),
         "town": None,
     }
 
@@ -253,26 +332,116 @@ def validate(features: list[dict[str, Any]]) -> None:
                 sys.exit(1)
 
 
+def _build_hydroseq_index(raws: list[dict[str, Any]]) -> dict[int, str]:
+    idx: dict[int, str] = {}
+    for raw in raws:
+        attrs = raw.get("attributes", {})
+        hs = attrs.get("hydroseq")
+        nid = attrs.get("nhdplusid")
+        if hs is not None and nid is not None:
+            idx[int(hs)] = str(int(nid))
+    return idx
+
+
+def _unresolved_dnhydroseqs(
+    raws: list[dict[str, Any]], hydroseq_to_id: dict[int, str]
+) -> list[int]:
+    """Unique dnhydroseq values referenced but not yet in the index.
+
+    Filters out the NHDPlus sentinel 0 (terminal / no downstream).
+    """
+    missing: set[int] = set()
+    for raw in raws:
+        dn = raw.get("attributes", {}).get("dnhydroseq")
+        if dn is None:
+            continue
+        dn_i = int(dn)
+        if dn_i <= 0:
+            continue
+        if dn_i not in hydroseq_to_id:
+            missing.add(dn_i)
+    return sorted(missing)
+
+
 def main() -> None:
     raw_features = fetch_all_features()
     if not raw_features:
         print("FATAL: no features returned from NHDPlus HR.", file=sys.stderr)
         sys.exit(1)
 
-    # Build hydroseq -> nhdplusid lookup from ALL raw features first
-    hydroseq_to_id: dict[int, str] = {}
-    for raw in raw_features:
-        attrs = raw.get("attributes", {})
-        hs = attrs.get("hydroseq")
-        nid = attrs.get("nhdplusid")
-        if hs is not None and nid is not None:
-            hydroseq_to_id[int(hs)] = str(int(nid))
+    # Iteratively back-fill unnamed connector segments at river junctions.
+    # The named-river WHERE clause drops short unnamed connectors that sit
+    # between e.g. the Missouri and the Mississippi — without them the graph
+    # fractures at every confluence. Fetch by hydroseq until all dnhydroseq
+    # pointers either resolve or point outside the watershed.
+    hydroseq_to_id = _build_hydroseq_index(raw_features)
+    for iteration in range(1, MAX_CONNECTOR_ITERATIONS + 1):
+        missing = _unresolved_dnhydroseqs(raw_features, hydroseq_to_id)
+        if not missing:
+            print(
+                f"Connector back-fill: converged after {iteration - 1} iteration(s)."
+            )
+            break
+        print(
+            f"Connector back-fill iter {iteration}: "
+            f"{len(missing)} unresolved dnhydroseq references."
+        )
+        connectors = fetch_connectors_by_hydroseq(missing)
+        new_raws = [
+            c for c in connectors
+            if (hs := c.get("attributes", {}).get("hydroseq")) is not None
+            and int(hs) not in hydroseq_to_id
+        ]
+        print(f"  Added {len(new_raws)} new connector segments.")
+        if not new_raws:
+            break
+        raw_features.extend(new_raws)
+        hydroseq_to_id = _build_hydroseq_index(raw_features)
+    else:
+        remaining = len(_unresolved_dnhydroseqs(raw_features, hydroseq_to_id))
+        print(
+            f"WARN: back-fill hit cap of {MAX_CONNECTOR_ITERATIONS} iterations "
+            f"with {remaining} unresolved references."
+        )
 
+    # First pass: segments with valid vama. We need these in hand to supply
+    # downstream-neighbor velocities to connectors whose vama is -9998.
     features: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
     for raw in raw_features:
+        vama = raw.get("attributes", {}).get("vama")
+        if vama is not None and float(vama) <= 0:
+            deferred.append(raw)
+            continue
         feat = build_feature(raw, hydroseq_to_id)
         if feat is not None:
             features.append(feat)
+
+    velocity_by_segment_id: dict[str, float] = {
+        f["properties"]["segment_id"]: float(f["properties"]["flow_velocity"])
+        for f in features
+    }
+
+    # Second pass: patch connectors missing vama with their downstream
+    # neighbor's velocity, falling back to MIN_FALLBACK_VELOCITY_MPS.
+    patched = 0
+    for raw in deferred:
+        dn = raw.get("attributes", {}).get("dnhydroseq")
+        fallback: float | None = None
+        if dn is not None:
+            ds_id = hydroseq_to_id.get(int(dn))
+            if ds_id is not None:
+                fallback = velocity_by_segment_id.get(ds_id)
+        if fallback is None:
+            fallback = MIN_FALLBACK_VELOCITY_MPS
+        feat = build_feature(raw, hydroseq_to_id, velocity_fallback_mps=fallback)
+        if feat is not None:
+            features.append(feat)
+            patched += 1
+    if patched:
+        print(
+            f"Patched {patched} connector segment(s) via downstream-neighbor velocity."
+        )
 
     validate(features)
     attached = attach_towns(features)
