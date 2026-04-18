@@ -70,7 +70,7 @@ export class WatershedStack extends Stack {
       encryption: s3.BucketEncryption.S3_MANAGED,
     });
 
-    const exportsBucket = new s3.Bucket(this, "ExportsBucket", {
+    new s3.Bucket(this, "ExportsBucket", {
       removalPolicy: RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,

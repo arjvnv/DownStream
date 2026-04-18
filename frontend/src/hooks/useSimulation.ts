@@ -29,7 +29,7 @@ export function useSimulationDriver() {
     if (appsync) {
       return appsync.subscribeToTicks(
         simulationId,
-        (t) => applyTickUpdate(t.tick, t.segmentUpdates, t.towns),
+        (t) => applyTickUpdate(t.tick, t.segmentUpdates as ReadonlyArray<[string, import("@/types/simulation").SegmentState]>, t.towns),
         (report) => completeSimulation(report),
         () => {
           /* surfaced via status */

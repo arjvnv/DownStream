@@ -1,7 +1,7 @@
 // Hand-authored GraphQL operations mirroring backend/graphql/schema.graphql.
 // Regenerate via @aws-amplify codegen once the endpoint exists.
 
-import type { RiskLevel, SegmentState, TickUpdate } from "../stores/simulation";
+import type { RiskLevel, SegmentState } from "../types/simulation";
 
 export type Basin = "MISSISSIPPI" | "OHIO" | "COLORADO";
 export type SpillType =
@@ -35,7 +35,29 @@ export interface StartSimulationResult {
   executionArn: string;
 }
 
-export type { RiskLevel, SegmentState, TickUpdate };
+export interface SegmentUpdate {
+  segmentId: string;
+  concentration: number;
+  riskLevel: RiskLevel;
+}
+
+export interface TownRiskUpdate {
+  townId: string;
+  name: string;
+  population: number;
+  segmentId: string;
+  riskLevel: RiskLevel;
+  tickCrossed: number | null;
+}
+
+export interface TickUpdate {
+  simulationId: string;
+  tick: number;
+  segmentUpdates: ReadonlyArray<[string, SegmentState]>;
+  towns: ReadonlyArray<TownRiskUpdate>;
+}
+
+export type { RiskLevel, SegmentState };
 
 export const START_SIMULATION = /* GraphQL */ `
   mutation StartSimulation($input: StartSimulationInput!) {

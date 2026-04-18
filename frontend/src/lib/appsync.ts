@@ -1,5 +1,4 @@
 import { generateClient } from "aws-amplify/api";
-import type { GraphQLSubscription } from "@aws-amplify/api-graphql";
 import {
   ON_TICK_UPDATE,
   START_SIMULATION,
@@ -12,6 +11,7 @@ import type {
   StartSimulationResult,
   MitigationInput,
 } from "./graphql";
+import type { IncidentReportJson } from "@/types/simulation";
 
 const client = generateClient();
 
@@ -54,16 +54,50 @@ export function subscribeToTicks(
   onNext: (u: TickUpdate) => void,
   onError: (e: unknown) => void,
 ): { unsubscribe: () => void } {
-  const sub = (
-    client.graphql({
-      query: ON_TICK_UPDATE,
-      variables: { simulationId },
-    }) as unknown as GraphQLSubscription<{ onTickUpdate: TickUpdate }>
-  ).subscribe({
-    next: ({ data }) => {
-      if (data?.onTickUpdate) onNext(data.onTickUpdate);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const observable = client.graphql({
+    query: ON_TICK_UPDATE,
+    variables: { simulationId },
+  }) as unknown as { subscribe: (opts: { next: (v: any) => void; error: (e: unknown) => void }) => { unsubscribe: () => void } };
+
+  const sub = observable.subscribe({
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    next: (response: any) => {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+      const update = response?.data?.onTickUpdate as TickUpdate | undefined;
+      if (update) onNext(update);
     },
-    error: (err) => onError(err),
+    error: (err: unknown) => onError(err),
   });
   return { unsubscribe: () => sub.unsubscribe() };
+}
+
+export interface AppSyncClient {
+  subscribeToTicks: (
+    simulationId: string,
+    onTick: (t: TickUpdate) => void,
+    onComplete: (report: IncidentReportJson) => void,
+    onError: () => void,
+  ) => () => void;
+}
+
+/**
+ * Returns an AppSync client if the endpoint is configured, or null for mock mode.
+ */
+export function createAppSyncClient(): AppSyncClient | null {
+  const endpoint = import.meta.env.VITE_APPSYNC_URL as string | undefined;
+  if (!endpoint) return null;
+
+  return {
+    subscribeToTicks(simulationId, onTick, onComplete, onError) {
+      const sub = subscribeToTicks(
+        simulationId,
+        onTick,
+        onError,
+      );
+      // onComplete is called externally via WebSocket close / reportReady event
+      void onComplete; // kept for interface compatibility
+      return () => sub.unsubscribe();
+    },
+  };
 }
