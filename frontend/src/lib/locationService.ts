@@ -1,15 +1,26 @@
-/**
- * Amazon Location Service helpers (geocode + map resource lookup).
- *
- * Stubbed for local dev. Populate VITE_ALS_MAP_NAME and VITE_ALS_API_KEY via
- * Amplify build env to activate. The map component falls back to the free
- * OSM tile source in baseStyle when these are absent.
- */
-export const alsMapName = import.meta.env.VITE_LOCATION_MAP;
-export const alsApiKey = import.meta.env.VITE_LOCATION_API_KEY;
-const awsRegion = import.meta.env.VITE_AWS_REGION ?? "us-west-2";
+import { awsExports } from "../aws-exports";
+
+export function getMapStyleUrl(): string {
+  const { aws_location_map_name, aws_region, aws_location_api_key } = awsExports;
+  const base = `https://maps.geo.${aws_region}.amazonaws.com/maps/v0/maps/${aws_location_map_name}/style-descriptor`;
+  if (aws_location_api_key) {
+    return `${base}?key=${encodeURIComponent(aws_location_api_key)}`;
+  }
+  return base;
+}
 
 export function alsStyleUrl(): string | null {
-  if (!alsMapName || !alsApiKey) return null;
-  return `https://maps.geo.${awsRegion}.amazonaws.com/maps/v0/maps/${alsMapName}/style-descriptor?key=${encodeURIComponent(alsApiKey)}`;
+  const { aws_location_map_name, aws_region, aws_location_api_key } = awsExports;
+  if (!aws_location_map_name || !aws_region) return null;
+  const base = `https://maps.geo.${aws_region}.amazonaws.com/maps/v0/maps/${aws_location_map_name}/style-descriptor`;
+  if (aws_location_api_key) {
+    return `${base}?key=${encodeURIComponent(aws_location_api_key)}`;
+  }
+  return base;
+}
+
+export function getBasinGeoJSONUrl(basin: "mississippi" | "ohio" | "colorado"): string {
+  const cdn = awsExports.aws_river_graphs_cdn;
+  if (!cdn) return `/${basin}.geojson`;
+  return `${cdn.replace(/\/$/, "")}/${basin}.geojson`;
 }
