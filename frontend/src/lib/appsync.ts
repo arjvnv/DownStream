@@ -29,7 +29,7 @@ export interface AppSyncClient {
   ) => () => void;
 }
 
-export const appsyncEndpoint = import.meta.env.VITE_APPSYNC_URL as string | undefined;
+export const appsyncEndpoint = import.meta.env.VITE_APPSYNC_URL;
 
 export function createAppSyncClient(): AppSyncClient | null {
   if (!appsyncEndpoint) return null;
